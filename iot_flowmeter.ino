@@ -1,405 +1,722 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <BluetoothSerial.h>
-#include <time.h>
+#include <Wire.h>
+#include <RTClib.h>
 
 BluetoothSerial SerialBT;
+RTC_DS1307 rtc;
 
-// Default WiFi Credentials (overridable via Bluetooth)
-String wifiSSID      = "Redmi";
-String wifiPassword  = "komet123";
-
-// Customer ID
+// Konfigurasi dasar
+String wifiSSID = "Redmi";
+String wifiPassword = "komet123";
 String customerID = "PAM0001";
 
-// Pin sensor
 #define SENSOR_PIN 18
+#define SDA_PIN 21  // Default SDA pin
+#define SCL_PIN 22  // Default SCL pin
 
-// File paths
-typedef const char* cstr;
-cstr CONFIG_PATH = "/config.txt";
-cstr LOG_PATH    = "/log.json";
+// Konstanta yang sangat konservatif
+const float ML_PER_PULSE = 1.0f / 450.0f;
+const unsigned long MEASURE_INTERVAL = 3000;   // 3 detik
+const unsigned long SAVE_INTERVAL = 60000;    // 1 menit
+const unsigned long BT_SEND_INTERVAL = 5000;   // 5 detik
 
-// Sensor calibration
-const float ML_PER_PULSE = 2.25f / 1000.0f; // 2.25 mL per pulse
+// NTP Configuration
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 25200;     // GMT+7 (Indonesia) = 7 * 3600
+const int daylightOffset_sec = 0;
 
-// Intervals
-const unsigned long MEASURE_INTERVAL = 1000;  // 1 detik
-const unsigned long FLUSH_INTERVAL   = 120000; // 2 menit
-const int BUFFER_SIZE                = 5;
+// Tambahkan konstanta untuk sync policy
+const unsigned long SYNC_VALIDITY_PERIOD = 2592000; // 30 hari dalam detik
+const unsigned long RTC_MIN_VALID_TIME = 1577836800; // 1 Jan 2020
 
-// Runtime variables
+// Variables dengan inisialisasi yang aman
 volatile unsigned int pulseCount = 0;
-float totalVolume   = 0.0f;
+float totalVolume = 0.0f;
 float currentFlowRate = 0.0f;
-
-// Buffer for log entries
-String dataBuffer[BUFFER_SIZE];
-int bufferIndex = 0;
-
 bool clientConnected = false;
+bool systemReady = false;
+bool rtcInitialized = false;
+bool ntpInitialized = false;
+bool wifiSyncCompleted = false;
 
-// ISR for sensor pulses
+// Tambahkan variable untuk tracking sync
+bool skipWiFiSync = false;
+time_t lastSyncTime = 0;
+
+// Buffer data sederhana
+struct DataEntry {
+  float volume;
+  time_t timestamp;
+};
+
+DataEntry currentData = {0.0f, 0};
+bool hasNewData = false;
+
+// ISR yang sangat minimal dan aman
 void IRAM_ATTR onPulse() {
   pulseCount++;
 }
 
-// Save WiFi config to LittleFS
-void saveWifiConfig(const String &ssid, const String &pass) {
-  File f = LittleFS.open(CONFIG_PATH, FILE_WRITE);
-  if (!f) {
-    Serial.println("[FS] Gagal membuka config.txt untuk ditulis");
-    return;
+// Initialize RTC
+bool initRTC() {
+  Serial.println("[RTC] Initializing DS1307...");
+  
+  if (!rtc.begin()) {
+    Serial.println("[RTC] DS1307 not found!");
+    return false;
   }
-  f.println(ssid);
-  f.println(pass);
-  f.close();
-  Serial.println("[FS] Konfigurasi WiFi disimpan: SSID=" + ssid);
+  
+  if (!rtc.isrunning()) {
+    Serial.println("[RTC] DS1307 was not running, setting time...");
+    // Set RTC to compile time if not running
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+  
+  DateTime now = rtc.now();
+  Serial.println("[RTC] DS1307 initialized successfully!");
+  Serial.printf("[RTC] Current RTC time: %04d-%02d-%02d %02d:%02d:%02d\n", 
+                now.year(), now.month(), now.day(), 
+                now.hour(), now.minute(), now.second());
+  
+  rtcInitialized = true;
+  return true;
 }
 
-// Load WiFi config from LittleFS if exists
-void loadWifiConfig() {
-  if (!LittleFS.exists(CONFIG_PATH)) {
-    Serial.println("[FS] config.txt tidak ditemukan. Menggunakan kredensial WiFi default.");
-    return;
-  }
-  File f = LittleFS.open(CONFIG_PATH, FILE_READ);
-  if (!f) {
-    Serial.println("[FS] Gagal membuka config.txt untuk dibaca");
-    return;
-  }
-  String s = f.readStringUntil('\n'); s.trim();
-  String p = f.readStringUntil('\n'); p.trim();
-  f.close();
-
-  if (s.length() > 0) {
-    wifiSSID = s;
-    Serial.println("[FS] SSID WiFi dimuat dari config: " + wifiSSID);
-  } else {
-    Serial.println("[FS] SSID kosong di config.txt. Menggunakan SSID default.");
-  }
-  // Password bisa kosong untuk jaringan terbuka
-  // Selalu update password jika ada di file, bahkan jika kosong
-  wifiPassword = p;
-  if (s.length() > 0) { // Hanya tampilkan pesan jika SSID juga dimuat, agar tidak membingungkan
-    Serial.println("[FS] Password WiFi dimuat dari config.");
-  }
-}
-
-// SNTP time initialization
-void setupTime() {
-  // Hanya coba konfigurasi waktu jika WiFi terhubung
-  if (WiFi.status() == WL_CONNECTED) {
-    configTime(25200, 0, "pool.ntp.org"); // GMT+7 (WIB)
-    struct tm ti;
-    if (!getLocalTime(&ti)) {
-      Serial.println("[TIME] Sinkronisasi NTP gagal meskipun WiFi terhubung.");
-    } else {
-      Serial.println("[TIME] Sinkronisasi NTP berhasil.");
-    }
-  } else {
-    Serial.println("[TIME] WiFi tidak terhubung, sinkronisasi NTP dilewati.");
-  }
-}
-
-// Get formatted datetime
-String getDateTime() {
-  struct tm ti;
-  if (!getLocalTime(&ti, 5000)) { // Tambahkan timeout kecil untuk getLocalTime
-    // Jika gagal mendapatkan waktu (misalnya NTP belum sinkron), kembalikan placeholder
-    return "00/00/0000 00:00:00";
-  }
-  char buf[20];
-  sprintf(buf, "%02d/%02d/%04d %02d:%02d:%02d",
-          ti.tm_mday, ti.tm_mon + 1, ti.tm_year + 1900,
-          ti.tm_hour, ti.tm_min, ti.tm_sec);
-  return String(buf);
-}
-
-// Append log entry into JSON array in LittleFS
-void appendLog(const String &entry) {
-  if (!LittleFS.exists(LOG_PATH)) {
-    File f = LittleFS.open(LOG_PATH, FILE_WRITE);
-    if (f) {
-      f.print("[]");
-      f.close();
-    } else {
-      Serial.println("[FS] Gagal membuat log.json awal");
-      return;
+// Get epoch time with priority: RTC > NTP > millis
+time_t getEpochTime() {
+  // Priority 1: RTC
+  if (rtcInitialized) {
+    DateTime now = rtc.now();
+    time_t rtcTime = now.unixtime();
+    
+    // Validate RTC time (should be after 2020)
+    if (rtcTime > 1577836800) { // 1 Jan 2020
+      return rtcTime;
     }
   }
-  File r = LittleFS.open(LOG_PATH, FILE_READ);
-  if (!r) {
-    Serial.println("[FS] Gagal membuka log.json untuk dibaca (append)");
-    return;
+  
+  // Priority 2: NTP (if available)
+  if (ntpInitialized) {
+    time_t now;
+    time(&now);
+    if (now > 1577836800) { // Validate NTP time
+      return now;
+    }
   }
-  String c = r.readString();
-  r.close();
-  c.trim();
-
-  if (c.length() < 2 || !c.startsWith("[") || !c.endsWith("]")) {
-    Serial.println("[LOG] Format log.json tidak valid, mereset ke []");
-    c = "[]"; // Reset ke array kosong jika format tidak sesuai
-  }
-
-  // Hapus ']' terakhir
-  c = c.substring(0, c.length() - 1);
-
-  // Tambahkan koma jika sudah ada entri sebelumnya
-  if (c.length() > 1 && c != "[") { // Pastikan bukan hanya "["
-    c += ",\n";
-  }
-  c += entry + "]";
-
-  File w = LittleFS.open(LOG_PATH, FILE_WRITE); // Mode FILE_WRITE akan menimpa file
-  if (!w) {
-    Serial.println("[FS] Gagal membuka log.json untuk ditulis (append)");
-    return;
-  }
-  w.print(c);
-  w.flush();
-  w.close();
+  
+  // Priority 3: Fallback to millis
+  return millis() / 1000;
 }
 
-// Send log file to Bluetooth client
-void sendLogFile() {
-  if (!LittleFS.exists(LOG_PATH)) {
-    SerialBT.println("[CMD] Log file tidak ditemukan");
-    return;
+// Format timestamp ke string readable
+String formatTimestamp(time_t epochTime) {
+  if (epochTime < 1577836800) { // Before 2020
+    return String((unsigned long)epochTime); // Return epoch jika tidak valid
   }
-
-  File f = LittleFS.open(LOG_PATH, FILE_READ);
-  if (!f) {
-    SerialBT.println("[CMD] Gagal membuka log file");
-    return;
+  
+  struct tm *timeinfo = localtime(&epochTime);
+  if (timeinfo == nullptr) {
+    return String((unsigned long)epochTime);
   }
+  
+  char buffer[20];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+  return String(buffer);
+}
 
-  String content = f.readString();
-  f.close();
-
-  if (content.length() < 2 || !content.startsWith("[") || !content.endsWith("]")) {
-    SerialBT.println("[CMD] Format log tidak valid");
-    return;
+// Tambahkan fungsi untuk load last sync time
+void loadLastSyncTime() {
+  String content;
+  if (safeReadFile("/sync.txt", content)) {
+    content.trim();
+    if (content.length() > 0) {
+      lastSyncTime = content.toInt();
+      Serial.println("[LOAD] Last sync: " + formatTimestamp(lastSyncTime));
+    }
   }
+}
 
-  // Hapus tanda kurung siku offenbar
-  content = content.substring(1, content.length() - 1);
-  content.trim(); // Hapus spasi ekstra jika ada
+// Tambahkan fungsi untuk save last sync time
+void saveLastSyncTime() {
+  time_t currentTime = getEpochTime();
+  String content = String((unsigned long)currentTime);
+  if (safeWriteFile("/sync.txt", content)) {
+    lastSyncTime = currentTime;
+    Serial.println("[SAVE] Sync time saved: " + formatTimestamp(currentTime));
+  }
+}
 
-  // Jika konten kosong setelah menghapus kurung (misalnya "[]")
-  if (content.length() == 0) {
-    SerialBT.println("[LOG] Log kosong.");
-    SerialBT.println("[CMD] Log data terkirim");
+// Tambahkan fungsi untuk cek apakah perlu sync
+bool needsTimeSync() {
+  if (!rtcInitialized) {
+    Serial.println("[CHECK] RTC not initialized, need sync");
+    return true;
+  }
+  
+  DateTime now = rtc.now();
+  time_t rtcTime = now.unixtime();
+  
+  // Cek apakah RTC time valid
+  if (rtcTime < RTC_MIN_VALID_TIME) {
+    Serial.println("[CHECK] RTC time invalid, need sync");
+    return true;
+  }
+  
+  // Cek apakah sudah terlalu lama tidak sync
+  if (lastSyncTime > 0) {
+    time_t timeSinceSync = rtcTime - lastSyncTime;
+    if (timeSinceSync > SYNC_VALIDITY_PERIOD) {
+      Serial.println("[CHECK] Last sync too old (" + String(timeSinceSync/86400) + " days), need sync");
+      return true;
+    } else {
+      Serial.println("[CHECK] RTC still valid (" + String(timeSinceSync/86400) + " days since sync)");
+      return false;
+    }
+  }
+  
+  // Jika tidak ada record sync sebelumnya, tapi RTC valid, skip sync
+  Serial.println("[CHECK] RTC valid, no sync needed");
+  return false;
+}
+
+// Initialize NTP time (one-time sync)
+void initNTP() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[NTP] WiFi not connected");
     return;
   }
   
+  Serial.println("[NTP] Initializing NTP...");
+  
+  // Configure NTP
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  // Wait for time to be set with timeout
+  Serial.print("[NTP] Waiting for NTP sync");
+  unsigned long startTime = millis();
+  time_t now = 0;
+  
+  while (now < 1577836800 && millis() - startTime < 10000) { // 10 second timeout
+    time(&now);
+    delay(500);
+    Serial.print(".");
+  }
+  
+  if (now > 1577836800) {
+    ntpInitialized = true;
+    Serial.println();
+    Serial.println("[NTP] NTP synchronized successfully!");
+    Serial.println("[NTP] Current NTP time: " + formatTimestamp(now));
+    
+    // Sync RTC with NTP if both are available
+    if (rtcInitialized) {
+      syncRTCWithNTP();
+      Serial.println("[NTP] RTC synced with NTP, disconnecting WiFi...");
+    }
+    
+    // Disconnect WiFi after successful sync
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    wifiSyncCompleted = true;
+    Serial.println("[NTP] WiFi disconnected to save power");
+    
+  } else {
+    Serial.println();
+    Serial.println("[NTP] NTP sync failed");
+    ntpInitialized = false;
+    
+    // Still disconnect WiFi even if sync failed
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    Serial.println("[NTP] WiFi disconnected after failed sync");
+  }
+}
+
+// Sync RTC with NTP
+void syncRTCWithNTP() {
+  if (!rtcInitialized || !ntpInitialized) {
+    Serial.println("[SYNC] RTC or NTP not available for sync");
+    return;
+  }
+  
+  time_t ntpTime;
+  time(&ntpTime);
+  
+  if (ntpTime > 1577836800) {
+    DateTime ntpDateTime(ntpTime);
+    rtc.adjust(ntpDateTime);
+    Serial.println("[SYNC] RTC synced with NTP: " + formatTimestamp(ntpTime));
+    
+    // Save sync time menggunakan NTP time, bukan getEpochTime()
+    String content = String((unsigned long)ntpTime);
+    if (safeWriteFile("/sync.txt", content)) {
+      lastSyncTime = ntpTime;
+      Serial.println("[SAVE] Sync time saved: " + formatTimestamp(ntpTime));
+    }
+  } else {
+    Serial.println("[SYNC] Invalid NTP time, sync failed");
+  }
+}
+
+// Set RTC time manually (format: YYYY,MM,DD,HH,MM,SS)
+bool setRTCTime(const String& timeStr) {
+  if (!rtcInitialized) return false;
+  
+  // Parse time string: YYYY,MM,DD,HH,MM,SS
+  int values[6];
+  int valueIndex = 0;
   int startPos = 0;
-  int braceCount = 0;
-  String entry = "";
-
-  for (int i = 0; i < content.length(); i++) {
-    char currentChar = content.charAt(i);
-    if (currentChar == '{') {
-      if (braceCount == 0) {
-        startPos = i;
+  
+  for (int i = 0; i <= timeStr.length() && valueIndex < 6; i++) {
+    if (i == timeStr.length() || timeStr.charAt(i) == ',') {
+      if (i > startPos) {
+        values[valueIndex] = timeStr.substring(startPos, i).toInt();
+        valueIndex++;
       }
-      braceCount++;
-    } else if (currentChar == '}') {
-      braceCount--;
-      if (braceCount == 0) {
-        entry = content.substring(startPos, i + 1);
-        entry.trim();
-        if (entry.length() > 0) {
-          SerialBT.println("[LOG] " + entry);
-          delay(20); // Delay kecil untuk menghindari buffer overflow Bluetooth
-        }
+      startPos = i + 1;
+    }
+  }
+  
+  if (valueIndex == 6) {
+    DateTime newTime(values[0], values[1], values[2], values[3], values[4], values[5]);
+    rtc.adjust(newTime);
+    Serial.printf("[RTC] Time set to: %04d-%02d-%02d %02d:%02d:%02d\n", 
+                  values[0], values[1], values[2], values[3], values[4], values[5]);
+    return true;
+  }
+  
+  return false;
+}
+
+// Fungsi aman untuk membaca file
+bool safeReadFile(const char* path, String& content) {
+  if (!LittleFS.exists(path)) return false;
+  
+  File file = LittleFS.open(path, FILE_READ);
+  if (!file) return false;
+  
+  content = file.readString();
+  file.close();
+  return true;
+}
+
+// Fungsi aman untuk menulis file
+bool safeWriteFile(const char* path, const String& content) {
+  File file = LittleFS.open(path, FILE_WRITE);
+  if (!file) return false;
+  
+  file.print(content);
+  file.close();
+  return true;
+}
+
+// Load total volume dengan safety check
+void loadTotalVolume() {
+  String content;
+  if (safeReadFile("/total.txt", content)) {
+    content.trim();
+    if (content.length() > 0) {
+      totalVolume = content.toFloat();
+      Serial.println("[LOAD] Total: " + String(totalVolume, 3) + "L");
+    }
+  }
+}
+
+// Save total volume dengan safety check
+void saveTotalVolume() {
+  String content = String(totalVolume, 3);
+  if (safeWriteFile("/total.txt", content)) {
+    Serial.println("[SAVE] Total saved: " + content + "L");
+  }
+}
+
+// Load WiFi config dengan safety check
+void loadWifiConfig() {
+  String content;
+  if (safeReadFile("/config.txt", content)) {
+    int newlinePos = content.indexOf('\n');
+    if (newlinePos > 0) {
+      String ssid = content.substring(0, newlinePos);
+      String pass = content.substring(newlinePos + 1);
+      
+      ssid.trim();
+      pass.trim();
+      
+      if (ssid.length() > 0) {
+        wifiSSID = ssid;
+        wifiPassword = pass;
+        Serial.println("[LOAD] WiFi config loaded: " + ssid);
       }
     }
   }
-  SerialBT.println("[CMD] Log data terkirim");
 }
 
-// Flush buffered entries
-void flushBuffer() {
-  if (!bufferIndex) return;
-  Serial.print("[LOG] Flushing buffer: "); Serial.println(bufferIndex);
-  for (int i = 0; i < bufferIndex; ++i) {
-    appendLog(dataBuffer[i]);
+// Save data log dengan format sederhana
+void saveDataLog() {
+  if (!hasNewData) return;
+  
+  time_t realTime = getEpochTime();
+  String logEntry = String((unsigned long)realTime) + "," + String(currentData.volume, 3) + "\n";
+  
+  // Append ke file log
+  File file = LittleFS.open("/log.csv", FILE_APPEND);
+  if (file) {
+    file.print(logEntry);
+    file.close();
+    Serial.println("[LOG] Data saved");
   }
-  bufferIndex = 0;
+  
+  hasNewData = false;
 }
 
-// Process commands via Bluetooth
-void processBTCommand(const String &cmd) {
-  Serial.println("[BT CMD] Received: " + cmd);
+// Tambahkan fungsi untuk reconnect WiFi manual
+void reconnectWiFiForSync() {
+  Serial.println("[WIFI] Manual reconnect for sync...");
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+  
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000) {
+    delay(250);
+    Serial.print(".");
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n[WIFI] Reconnected: " + WiFi.localIP().toString());
+    wifiSyncCompleted = false; // Allow new sync
+  } else {
+    Serial.println("\n[WIFI] Reconnect failed");
+    WiFi.mode(WIFI_OFF);
+  }
+}
+
+bool isValidRTCTime(const DateTime& dt) {
+  return (dt.year() >= 2020 && dt.year() <= 2100 && 
+          dt.month() >= 1 && dt.month() <= 12 && 
+          dt.day() >= 1 && dt.day() <= 31 && 
+          dt.hour() <= 23 && dt.minute() <= 59 && dt.second() <= 59);
+}
+
+// Enhanced command processor dengan RTC commands
+void processBTCommand(const String& cmd) {
+  Serial.println("[CMD] " + cmd);
+  
   if (cmd == "RESET_LOG") {
-    if (LittleFS.remove(LOG_PATH)) {
-      SerialBT.println("[CMD] Log di-reset");
-    } else {
-      SerialBT.println("[CMD] Gagal mereset log");
-    }
+    LittleFS.remove("/log.csv");
+    SerialBT.println("OK:LOG_RESET");
+  } else if (cmd == "GET_CUSTOMER") {
+    SerialBT.println("ID:" + customerID);
   } else if (cmd == "RESET_TOTAL") {
     totalVolume = 0.0f;
-    SerialBT.println("[CMD] Total volume di-reset");
+    LittleFS.remove("/total.txt");
+    SerialBT.println("OK:TOTAL_RESET");
+    
   } else if (cmd == "RESET_ALL") {
-    LittleFS.remove(LOG_PATH);
     totalVolume = 0.0f;
-    bufferIndex = 0; // Juga reset buffer
-    SerialBT.println("[CMD] Semua data di-reset");
+    LittleFS.remove("/total.txt");
+    LittleFS.remove("/log.csv");
+    SerialBT.println("OK:ALL_RESET");
+    
   } else if (cmd.startsWith("SET_WIFI:")) {
-    String p = cmd.substring(9);
-    int i = p.indexOf(',');
-    if (i > 0) {
-      String ns = p.substring(0, i);
-      String np = p.substring(i + 1);
-      saveWifiConfig(ns, np);
-      wifiSSID = ns;
-      wifiPassword = np;
-      SerialBT.println("[CMD] WiFi di-update: " + ns + ". Menyambungkan ulang...");
-      WiFi.disconnect(); // Putuskan koneksi lama
-      WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str()); // Coba sambungkan dengan kredensial baru
-    } else {
-      SerialBT.println("[CMD] Format SET_WIFI salah. Harusnya SET_WIFI:ssid,password");
+    String params = cmd.substring(9);
+    int commaPos = params.indexOf(',');
+    if (commaPos > 0) {
+      String newSSID = params.substring(0, commaPos);
+      String newPass = params.substring(commaPos + 1);
+      
+      String config = newSSID + "\n" + newPass;
+      if (safeWriteFile("/config.txt", config)) {
+        SerialBT.println("OK:WIFI_SET");
+      } else {
+        SerialBT.println("ERROR:WIFI_SET");
+      }
     }
-  } else if (cmd == "GET_LOG") {
-    sendLogFile();
+    
+  } else if (cmd == "GET_STATUS") {
+    String timeSource = "NO";
+    if (rtcInitialized) timeSource = "RTC";
+    else if (ntpInitialized) timeSource = "NTP";
+    
+    String wifiStatus = "OFF";
+    if (WiFi.status() == WL_CONNECTED) wifiStatus = "ON";
+    else if (wifiSyncCompleted) wifiStatus = "SYNCED";
+    
+    String status = "FLOW:" + String(currentFlowRate, 1) +
+                    ",TOTAL:" + String(totalVolume, 2) +
+                    ",WIFI:" + wifiStatus +
+                    ",TIME_SRC:" + timeSource +
+                    ",TIME:" + formatTimestamp(getEpochTime());
+    SerialBT.println(status);
+    
+  } else if (cmd == "GET_TIME") {
+    String timeSource = "MILLIS";
+    if (rtcInitialized) timeSource = "RTC";
+    else if (ntpInitialized) timeSource = "NTP";
+    
+    SerialBT.println("TIME:" + formatTimestamp(getEpochTime()) + ",SRC:" + timeSource);
+    
+  } else if (cmd == "SYNC_NTP") {
+    if (WiFi.status() == WL_CONNECTED) {
+      initNTP();
+      SerialBT.println("OK:NTP_SYNC");
+    } else {
+      SerialBT.println("ERROR:NO_WIFI");
+    }
+    
+  } else if (cmd == "RECONNECT_WIFI") {
+    reconnectWiFiForSync();
+    if (WiFi.status() == WL_CONNECTED) {
+      SerialBT.println("OK:WIFI_CONNECTED");
+    } else {
+      SerialBT.println("ERROR:WIFI_FAILED");
+    }
+    
+  } else if (cmd == "SYNC_NTP_FULL") {
+    // Full sync: reconnect WiFi + sync NTP + sync RTC
+    reconnectWiFiForSync();
+    if (WiFi.status() == WL_CONNECTED) {
+      delay(1000);
+      initNTP(); // This will also disconnect WiFi after sync
+      SerialBT.println("OK:FULL_SYNC");
+    } else {
+      SerialBT.println("ERROR:WIFI_FAILED");
+    }
+    
+  } else if (cmd == "SET_RTC:") {
+    String timeStr = cmd.substring(8);
+    if (setRTCTime(timeStr)) {
+      SerialBT.println("OK:RTC_SET");
+    } else {
+      SerialBT.println("ERROR:RTC_SET");
+    }
+    
+  } else if (cmd == "GET_RTC") {
+  if (rtcInitialized) {
+    DateTime now = rtc.now();
+    if (isValidRTCTime(now)) {
+      SerialBT.printf("RTC:%04d-%02d-%02d %02d:%02d:%02d\n", 
+                      now.year(), now.month(), now.day(), 
+                      now.hour(), now.minute(), now.second());
+    } else {
+      SerialBT.println("ERROR:RTC_CORRUPTED");
+      // Reset RTC ke compile time
+      rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    }
   } else {
-    SerialBT.println("[CMD] Unknown: " + cmd);
+    SerialBT.println("ERROR:NO_RTC");
+  }
+} else if (cmd == "SYNC_RTC") {
+    if (rtcInitialized && ntpInitialized) {
+      syncRTCWithNTP();
+      SerialBT.println("OK:RTC_SYNC");
+    } else {
+      SerialBT.println("ERROR:RTC_NTP_NOT_READY");
+    }
+    
+  } else if (cmd == "GET_LOG") {
+    // Kirim log dalam format CSV sederhana
+    String content;
+    if (safeReadFile("/log.csv", content)) {
+      if (content.length() > 2000) {
+        SerialBT.println("ERROR:LOG_TOO_LARGE");
+      } else {
+        SerialBT.println("LOG_START");
+        SerialBT.print(content);
+        SerialBT.println("LOG_END");
+      }
+    } else {
+      SerialBT.println("ERROR:NO_LOG");
+    }
+  } else if (cmd == "GET_SYNC_STATUS") {
+    if (lastSyncTime > 0) {
+      time_t currentTime = getEpochTime();
+      time_t daysSinceSync = (currentTime - lastSyncTime) / 86400;
+      SerialBT.println("SYNC_STATUS:LAST=" + formatTimestamp(lastSyncTime) + 
+                       ",DAYS_AGO=" + String(daysSinceSync) +
+                       ",VALID=" + String(daysSinceSync < 30 ? "YES" : "NO"));
+    } else {
+      SerialBT.println("SYNC_STATUS:NEVER_SYNCED");
+    }
+    
+  } else if (cmd == "FORCE_SYNC") {
+    // Force sync meskipun RTC masih valid
+    reconnectWiFiForSync();
+    if (WiFi.status() == WL_CONNECTED) {
+      delay(1000);
+      initNTP(); // This will also disconnect WiFi after sync
+      SerialBT.println("OK:FORCE_SYNC");
+    } else {
+      SerialBT.println("ERROR:WIFI_FAILED");
+    }
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n[SETUP] Memulai perangkat...");
-
-  // Inisialisasi LittleFS
+  delay(1000);
+  Serial.println("\n[SETUP] Starting Water Meter with RTC...");
+  
+  // Initialize I2C for RTC
+  Wire.begin(SDA_PIN, SCL_PIN);
+  delay(100);
+  
+  // Initialize RTC first
+  initRTC();
+  
+  // Mount LittleFS dengan error handling
   if (!LittleFS.begin(true)) {
-    Serial.println("[SETUP] LittleFS Mount Gagal. Perangkat berhenti.");
-    while (1) { delay(1000); } // Berhenti jika LittleFS gagal
+    Serial.println("[ERROR] LittleFS failed");
+    ESP.restart();
   }
-  Serial.println("[SETUP] LittleFS berhasil di-mount.");
-
-  loadWifiConfig(); // Muat konfigurasi WiFi dari LittleFS
-
-  // Inisialisasi Bluetooth SEBELUM mencoba koneksi WiFi
-  Serial.println("[SETUP] Menginisialisasi Bluetooth...");
-  SerialBT.begin("WaterMeter-IoT");
-  Serial.println("[SETUP] Bluetooth aktif, nama: WaterMeter-IoT. Menunggu koneksi...");
-
-  // Coba hubungkan ke WiFi (non-blocking)
-  Serial.println("[SETUP] Mencoba menghubungkan ke WiFi: " + wifiSSID);
-  WiFi.mode(WIFI_STA); // Set mode ke Station
-  WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
-
-  unsigned long wifiConnectStartTime = millis();
-  bool wifiConnectedInSetup = false;
-  Serial.print("[SETUP] Menunggu koneksi WiFi (maks 10 detik): ");
-  while (WiFi.status() != WL_CONNECTED && (millis() - wifiConnectStartTime < 10000)) {
-    Serial.print(".");
-    delay(500);
-  }
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    wifiConnectedInSetup = true;
-    Serial.println("[SETUP] WiFi terhubung!");
-    Serial.print("[SETUP] Alamat IP: ");
-    Serial.println(WiFi.localIP());
+  Serial.println("[SETUP] LittleFS OK");
+  
+  // Load data
+  loadTotalVolume();
+  loadWifiConfig();
+  loadLastSyncTime(); // Load last sync time
+  
+  // Cek apakah perlu sync WiFi
+  skipWiFiSync = !needsTimeSync();
+  
+  if (skipWiFiSync) {
+    Serial.println("[SETUP] RTC time valid, skipping WiFi sync");
+    Serial.println("[SETUP] Current RTC time: " + formatTimestamp(getEpochTime()));
   } else {
-    Serial.println("[SETUP] WiFi tidak dapat terhubung dalam 10 detik. Melanjutkan tanpa WiFi.");
+    Serial.println("[SETUP] Time sync needed, will connect WiFi");
   }
   
-  // Setup waktu (NTP). Akan gagal jika WiFi tidak terhubung, getDateTime() akan mengembalikan default.
-  setupTime(); 
-
+  // Init Bluetooth dengan nama sederhana
+  if (!SerialBT.begin("WaterMeter_RTC")) {
+    Serial.println("[ERROR] Bluetooth failed");
+    ESP.restart();
+  }
+  Serial.println("[SETUP] Bluetooth OK");
+  
+  // Setup sensor dengan pull-up
   pinMode(SENSOR_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onPulse, RISING);
-  Serial.println("[SETUP] Sensor pin dan interrupt dikonfigurasi.");
-
-  Serial.println("[SETUP] Setup selesai. Sistem berjalan.");
+  delay(100);
+  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), onPulse, FALLING);
+  Serial.println("[SETUP] Sensor OK");
+  
+  // WiFi connection (hanya jika diperlukan)
+  if (!skipWiFiSync) {
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+    
+    unsigned long startTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 5000) {
+      delay(250);
+      Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\n[SETUP] WiFi connected: " + WiFi.localIP().toString());
+      delay(1000);
+      initNTP();
+    } else {
+      Serial.println("\n[SETUP] WiFi failed, using RTC only...");
+    }
+  } else {
+    Serial.println("[SETUP] WiFi sync skipped, using RTC time");
+  }
+  
+  systemReady = true;
+  Serial.println("[SETUP] System ready with time source: " + 
+                 String(rtcInitialized ? "RTC" : (ntpInitialized ? "NTP" : "MILLIS")));
 }
 
 void loop() {
-  static unsigned long prevMeasure = 0;
-  static unsigned long prevFlush   = 0;
-  static unsigned long prevSend    = 0;
-  static bool customerIDSent = false; // Pindah ke sini agar statusnya persisten antar koneksi client
-
+  if (!systemReady) {
+    delay(100);
+    return;
+  }
+  
+  static unsigned long lastMeasure = 0;
+  static unsigned long lastSave = 0;
+  static unsigned long lastSend = 0;
+  static bool idSent = false;
+  
   unsigned long now = millis();
-
-  // Hitung flowrate dan buffer data
-  if (now - prevMeasure >= MEASURE_INTERVAL) {
-    prevMeasure = now;
+  
+  // Handle millis() overflow (setiap 49 hari)
+  if (now < lastMeasure) {
+    lastMeasure = now;
+    lastSave = now;
+    lastSend = now;
+  }
+  
+  // Check BT connection
+  bool hasClient = SerialBT.hasClient();
+  if (hasClient && !clientConnected) {
+    clientConnected = true;
+    idSent = false;
+    Serial.println("[BT] Connected");
+    delay(100); // Stabilize connection
+  } else if (!hasClient && clientConnected) {
+    clientConnected = false;
+    Serial.println("[BT] Disconnected");
+  }
+  
+  // Send customer ID once per connection
+  if (clientConnected && !idSent) {
+    SerialBT.println("ID:" + customerID);
+    idSent = true;
+    delay(50);
+  }
+  
+  // Measure flow
+  if (now - lastMeasure >= MEASURE_INTERVAL) {
+    lastMeasure = now;
     
-    // Ambil pulseCount secara atomik dan reset
+    // Get pulse count safely
     noInterrupts();
     unsigned int pulses = pulseCount;
     pulseCount = 0;
     interrupts();
-
-    if (pulses > 0) { // Hanya proses jika ada pulse
-      float litres = (float)pulses * ML_PER_PULSE; // Konversi ke float untuk kalkulasi
-      // Flow rate dihitung per detik, lalu dikonversi ke liter per menit
-      currentFlowRate = (litres / (MEASURE_INTERVAL / 1000.0f)) * 60.0f; 
+    
+    if (pulses > 0) {
+      float litres = pulses * ML_PER_PULSE;
+      currentFlowRate = (litres / (MEASURE_INTERVAL / 1000.0f)) * 60.0f;
       totalVolume += litres;
-
-      String entry = "{\"datetime\":\"" + getDateTime() + "\",";
-      entry += "\"total\":" + String(totalVolume, 3) + "}"; // presisi 3 desimal untuk volume
       
-      if (bufferIndex < BUFFER_SIZE) {
-          dataBuffer[bufferIndex++] = entry;
-      }
-      if (bufferIndex >= BUFFER_SIZE) {
-        flushBuffer();
-      }
+      // Store data for logging
+      currentData.volume = totalVolume;
+      currentData.timestamp = getEpochTime();
+      hasNewData = true;
+      
+      Serial.println("[FLOW] Rate: " + String(currentFlowRate, 2) + " L/min, Total: " + String(totalVolume, 3) + "L");
     } else {
-      currentFlowRate = 0.0f; // Tidak ada pulse, flow rate 0
+      currentFlowRate = 0.0f;
     }
   }
-
-  // Emergency flush jika buffer belum penuh tapi sudah waktunya
-  if (now - prevFlush >= FLUSH_INTERVAL) {
-    prevFlush = now;
-    if (bufferIndex > 0) { // Hanya flush jika ada data di buffer
-        Serial.println("[LOG] Interval flush tercapai.");
-        flushBuffer();
-    }
+  
+  // Save data periodically
+  if (now - lastSave >= SAVE_INTERVAL) {
+    lastSave = now;
+    saveDataLog();
+    saveTotalVolume();
   }
-
-  // Cek status koneksi Bluetooth
-  bool hasClient = SerialBT.hasClient();
-  if (hasClient && !clientConnected) {
-    clientConnected = true;
-    customerIDSent = false; // Reset flag saat client baru terhubung
-    Serial.println("[BT] Client terhubung");
-  } else if (!hasClient && clientConnected) {
-    clientConnected = false;
-    Serial.println("[BT] Client terputus");
-  }
-
-  // Kirim CustomerID saat Bluetooth terhubung (hanya sekali per koneksi)
-  if (clientConnected && !customerIDSent) {
-    SerialBT.println("CustomerID:" + customerID);
-    Serial.println("[BT] Mengirim CustomerID: " + customerID);
-    customerIDSent = true; // Set flag untuk mencegah pengiriman berulang
-  }
-
-  // Terima perintah via Bluetooth
+  
+  // Handle BT commands
   if (clientConnected && SerialBT.available()) {
     String cmd = SerialBT.readStringUntil('\n');
-    cmd.trim(); // Hapus spasi atau newline
-    if (cmd.length() > 0) { // Hanya proses jika ada perintah
-        processBTCommand(cmd);
+    cmd.trim();
+    if (cmd.length() > 0 && cmd.length() < 100) { // Limit command length
+      processBTCommand(cmd);
     }
   }
-
-  // Kirim data FlowRate dan TotalVolume via Bluetooth secara berkala
-  if (clientConnected && (now - prevSend >= 2000)) { // Kirim setiap 2 detik
-    prevSend = now;
-    String msg = "FlowRate:" + String(currentFlowRate, 2) + "/Lmin, Total:" + String(totalVolume, 3) + "L";
+  
+  // Send data to BT client
+  if (clientConnected && now - lastSend >= BT_SEND_INTERVAL) {
+    lastSend = now;
+    String msg = "DATA:" + String(currentFlowRate, 1) + "," + String(totalVolume, 2);
     SerialBT.println(msg);
-    // Serial.println("[BT] Sent: " + msg); // Bisa di-uncomment untuk debugging di Serial Monitor USB
   }
-
-  delay(10); // Delay kecil untuk stabilitas loop
+  
+  // Watchdog dan yield
+  yield();
+  delay(100);
 }
